@@ -1,22 +1,230 @@
-terraform {
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 4.0"
-    }
+provider "aws" {
+  region = "ap-northeast-2"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name        = "main-vpc"
+    project     = "ai-infra"
+    environment = "production"
   }
-  required_version = ">= 1.0.0"
 }
 
-provider "google" {
-  project = "ai-car-sales-project"
-  region  = "asia-northeast3" # 서울 리전
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-northeast-2a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name        = "public-subnet"
+    project     = "ai-infra"
+    environment = "production"
+  }
 }
 
-# VPC 네트워크 생성
-resource "google_compute_network" "ai_network" {
-  name                    = "ai-car-sales-network"
-  auto_create_subnetworks = false
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name        = "main-igw"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+
+  tags = {
+    Name        = "public-rt"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_security_group" "ai_service" {
+  name        = "ai-service-sg"
+  description = "Security group for AI service"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "API Service"
+    from_port   = 8000
+    to_port     = 8000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "ai-service-sg"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+resource "aws_iam_role" "ec2_role" {
+  name = "ai-service-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = {
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_policy" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy_attachment" "s3_policy" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "ai-service-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+resource "aws_instance" "ai_service" {
+  ami                    = "ami-04341a215040f91bb"  # Amazon Linux 2 with GPU support (Deep Learning AMI)
+  instance_type          = "g5.2xlarge"  # GPU instance with A10G 24GB
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.ai_service.id]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+  key_name               = "ai-service-key"  # Make sure to create this key pair in AWS console
+
+  root_block_device {
+    volume_size = 100  # GB
+    volume_type = "gp3"
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              yum update -y
+              yum install -y git python3-pip
+              pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+              pip3 install transformers
+              pip3 install fastapi uvicorn
+              
+              # Clone the application repository
+              git clone https://github.com/hyungtakChoi/air-workload-mz-icon.git /home/ec2-user/app
+              chown -R ec2-user:ec2-user /home/ec2-user/app
+              
+              # Setup application as a service
+              cat <<EOT > /etc/systemd/system/ai-service.service
+              [Unit]
+              Description=AI Service
+              After=network.target
+              
+              [Service]
+              User=ec2-user
+              WorkingDirectory=/home/ec2-user/app
+              ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+              Restart=always
+              
+              [Install]
+              WantedBy=multi-user.target
+              EOT
+              
+              systemctl daemon-reload
+              systemctl enable ai-service
+              systemctl start ai-service
+              EOF
+
+  tags = {
+    Name        = "ai-service-instance"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+resource "aws_eip" "ai_service" {
+  domain   = "vpc"
+  instance = aws_instance.ai_service.id
+  
+  tags = {
+    Name        = "ai-service-eip"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_alarm" {
+  alarm_name          = "ai-service-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "This metric monitors ec2 cpu utilization"
+  
+  dimensions = {
+    InstanceId = aws_instance.ai_service.id
+  }
+  
+  alarm_actions = []  # Add SNS topic ARN if needed
   
   tags = {
     project     = "ai-infra"
@@ -24,12 +232,22 @@ resource "google_compute_network" "ai_network" {
   }
 }
 
-# 서브넷 생성
-resource "google_compute_subnetwork" "ai_subnet" {
-  name          = "ai-car-sales-subnet"
-  ip_cidr_range = "10.0.0.0/24"
-  region        = "asia-northeast3"
-  network       = google_compute_network.ai_network.id
+resource "aws_cloudwatch_metric_alarm" "memory_alarm" {
+  alarm_name          = "ai-service-high-memory"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "mem_used_percent"
+  namespace           = "CWAgent"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "This metric monitors ec2 memory utilization"
+  
+  dimensions = {
+    InstanceId = aws_instance.ai_service.id
+  }
+  
+  alarm_actions = []  # Add SNS topic ARN if needed
   
   tags = {
     project     = "ai-infra"
@@ -37,154 +255,10 @@ resource "google_compute_subnetwork" "ai_subnet" {
   }
 }
 
-# 방화벽 규칙 - SSH 접속 허용
-resource "google_compute_firewall" "allow_ssh" {
-  name    = "allow-ssh"
-  network = google_compute_network.ai_network.name
-  
-  allow {
-    protocol = "tcp"
-    ports    = ["22"]
-  }
-  
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["ai-instance"]
-  
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
+output "public_ip" {
+  value = aws_eip.ai_service.public_ip
 }
 
-# 방화벽 규칙 - 웹 서비스 포트 허용
-resource "google_compute_firewall" "allow_web" {
-  name    = "allow-web-service"
-  network = google_compute_network.ai_network.name
-  
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "8000", "8080"]
-  }
-  
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["ai-instance"]
-  
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# GPU가 있는 Compute Engine VM 인스턴스
-resource "google_compute_instance" "ai_instance" {
-  name         = "ai-car-sales-server"
-  machine_type = "g2-standard-8"  # NVIDIA L4 GPU, 8vCPU, 32GB 메모리
-  zone         = "asia-northeast3-a"
-  
-  boot_disk {
-    initialize_params {
-      image = "projects/deeplearning-platform-release/global/images/family/common-gpu-debian-11"
-      size  = 100 # GB
-      type  = "pd-ssd"
-    }
-  }
-  
-  network_interface {
-    network    = google_compute_network.ai_network.id
-    subnetwork = google_compute_subnetwork.ai_subnet.id
-    access_config {
-      # 외부 IP 할당
-    }
-  }
-  
-  # GPU 설정
-  guest_accelerator {
-    type  = "nvidia-l4"
-    count = 1
-  }
-  
-  scheduling {
-    on_host_maintenance = "TERMINATE" # GPU VM 필요
-    automatic_restart   = true
-    preemptible         = false
-  }
-  
-  # 시작 스크립트 - Git clone, 기본 환경 설정, 필요한 패키지 설치
-  metadata_startup_script = <<-EOT
-    #!/bin/bash
-    apt-get update
-    apt-get install -y git python3-pip
-    
-    # Git 저장소 클론
-    git clone https://github.com/hyungtakChoi/air-workload-mz-icon.git /opt/ai-car-sales
-    
-    # 필요한 Python 패키지 설치
-    cd /opt/ai-car-sales
-    pip install -r requirements.txt
-    
-    # NVIDIA 드라이버와 CUDA 설정 (이미 이미지에 포함되어 있음)
-    # 기타 필요한 설정
-  EOT
-  
-  service_account {
-    scopes = ["cloud-platform"]
-  }
-  
-  tags = ["ai-instance"]
-  
-  labels = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# 영구 디스크 추가 - 모델 파일 저장용
-resource "google_compute_disk" "model_data_disk" {
-  name = "ai-model-data-disk"
-  type = "pd-ssd"
-  zone = "asia-northeast3-a"
-  size = 200 # GB
-  
-  labels = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# 영구 디스크 VM 연결
-resource "google_compute_attached_disk" "model_disk_attachment" {
-  disk     = google_compute_disk.model_data_disk.id
-  instance = google_compute_instance.ai_instance.id
-}
-
-# Cloud Storage 버킷 - 모델 파일 및 데이터 저장
-resource "google_storage_bucket" "model_storage" {
-  name          = "ai-car-sales-models"
-  location      = "ASIA-NORTHEAST3"
-  storage_class = "STANDARD"
-  
-  versioning {
-    enabled = true
-  }
-  
-  labels = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# IAM 서비스 계정 - VM에서 Cloud Storage 접근용
-resource "google_service_account" "ai_service_account" {
-  account_id   = "ai-service-account"
-  display_name = "AI Service Account"
-}
-
-# IAM 권한 부여
-resource "google_project_iam_binding" "storage_object_admin" {
-  project = "ai-car-sales-project"
-  role    = "roles/storage.objectAdmin"
-  
-  members = [
-    "serviceAccount:${google_service_account.ai_service_account.email}"
-  ]
+output "instance_id" {
+  value = aws_instance.ai_service.id
 }
