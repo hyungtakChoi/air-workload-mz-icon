@@ -1,99 +1,99 @@
 provider "aws" {
-  region = "ap-northeast-2"
+  region = "ap-northeast-2" # 서울 리전
 }
 
 # VPC 생성
-resource "aws_vpc" "ai_vpc" {
+resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
   enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = {
-    Name        = "ai-llama-vpc"
+    Name        = "ai-infra-vpc"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 인터넷 게이트웨이
-resource "aws_internet_gateway" "ai_igw" {
-  vpc_id = aws_vpc.ai_vpc.id
-
-  tags = {
-    Name        = "ai-llama-igw"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# 퍼블릭 서브넷
-resource "aws_subnet" "ai_public_subnet" {
-  vpc_id                  = aws_vpc.ai_vpc.id
+# 퍼블릭 서브넷 생성
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-2a"
   map_public_ip_on_launch = true
 
   tags = {
-    Name        = "ai-llama-public-subnet"
+    Name        = "ai-infra-public-subnet"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 라우팅 테이블
-resource "aws_route_table" "ai_public_rt" {
-  vpc_id = aws_vpc.ai_vpc.id
+# 인터넷 게이트웨이 생성
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name        = "ai-infra-igw"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# 라우팅 테이블 생성
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.ai_igw.id
+    gateway_id = aws_internet_gateway.gw.id
   }
 
   tags = {
-    Name        = "ai-llama-public-rt"
+    Name        = "ai-infra-public-rt"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 라우팅 테이블 연결
-resource "aws_route_table_association" "ai_public_rta" {
-  subnet_id      = aws_subnet.ai_public_subnet.id
-  route_table_id = aws_route_table.ai_public_rt.id
+# 서브넷에 라우팅 테이블 연결
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
 }
 
-# 보안 그룹
-resource "aws_security_group" "ai_sg" {
-  name        = "ai-llama-sg"
-  description = "Security group for AI LLaMA service"
-  vpc_id      = aws_vpc.ai_vpc.id
+# 보안 그룹 생성
+resource "aws_security_group" "allow_ssh_http" {
+  name        = "allow_ssh_http"
+  description = "Allow SSH and HTTP inbound traffic"
+  vpc_id      = aws_vpc.main.id
 
-  # SSH 접속
   ingress {
+    description = "SSH from anywhere"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # HTTP 접속
   ingress {
+    description = "HTTP from anywhere"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # HTTPS 접속
   ingress {
+    description = "HTTPS from anywhere"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # API 서버용 포트 (예: 8000)
   ingress {
+    description = "API port"
     from_port   = 8000
     to_port     = 8000
     protocol    = "tcp"
@@ -108,117 +108,15 @@ resource "aws_security_group" "ai_sg" {
   }
 
   tags = {
-    Name        = "ai-llama-sg"
+    Name        = "ai-infra-sg"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# EBS 볼륨 (모델 저장용)
-resource "aws_ebs_volume" "ai_model_volume" {
-  availability_zone = "ap-northeast-2a"
-  size              = 100
-  type              = "gp3"
-  iops              = 3000
-  throughput        = 125
-
-  tags = {
-    Name        = "ai-llama-model-volume"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# G5 인스턴스 (GPU 포함)
-resource "aws_instance" "ai_server" {
-  ami                    = "ami-0c9c942bd7bf113a2" # Amazon Linux 2 with GPU support
-  instance_type          = "g5.2xlarge"            # A10G GPU (24GB) 1개, vCPU 8개, 메모리 32GB
-  subnet_id              = aws_subnet.ai_public_subnet.id
-  vpc_security_group_ids = [aws_security_group.ai_sg.id]
-  key_name               = "ai-llama-key" # 미리 생성한 키페어 이름
-
-  root_block_device {
-    volume_type           = "gp3"
-    volume_size           = 50
-    delete_on_termination = true
-  }
-
-  tags = {
-    Name        = "ai-llama-server"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# EBS 볼륨 연결
-resource "aws_volume_attachment" "ai_model_attachment" {
-  device_name = "/dev/sdf"
-  volume_id   = aws_ebs_volume.ai_model_volume.id
-  instance_id = aws_instance.ai_server.id
-}
-
-# Elastic IP
-resource "aws_eip" "ai_eip" {
-  vpc = true
-
-  tags = {
-    Name        = "ai-llama-eip"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Elastic IP 연결
-resource "aws_eip_association" "ai_eip_assoc" {
-  instance_id   = aws_instance.ai_server.id
-  allocation_id = aws_eip.ai_eip.id
-}
-
-# CloudWatch 알람 (CPU 사용량)
-resource "aws_cloudwatch_metric_alarm" "ai_cpu_alarm" {
-  alarm_name          = "ai-llama-high-cpu"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = "2"
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = "300"
-  statistic           = "Average"
-  threshold           = "80"
-  alarm_description   = "This alarm monitors EC2 CPU utilization"
-  
-  dimensions = {
-    InstanceId = aws_instance.ai_server.id
-  }
-  
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# S3 버킷 (백업 및 모델 저장)
-resource "aws_s3_bucket" "ai_model_bucket" {
-  bucket = "ai-llama-model-bucket-${formatdate("YYYYMMDDhhmmss", timestamp())}"
-
-  tags = {
-    Name        = "ai-llama-model-bucket"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "ai_bucket_access" {
-  bucket = aws_s3_bucket.ai_model_bucket.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# IAM 역할 (EC2가 S3에 접근할 수 있도록)
-resource "aws_iam_role" "ai_ec2_role" {
-  name = "ai-llama-ec2-role"
+# EC2 인스턴스를 위한 IAM 역할
+resource "aws_iam_role" "ec2_role" {
+  name = "ec2_role_for_ai_infra"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -239,10 +137,16 @@ resource "aws_iam_role" "ai_ec2_role" {
   }
 }
 
-# IAM 정책 (S3 접근 권한)
-resource "aws_iam_policy" "ai_s3_access" {
-  name        = "ai-llama-s3-access"
-  description = "Allow access to S3 model bucket"
+# EC2 인스턴스 프로파일
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "ec2_profile_for_ai_infra"
+  role = aws_iam_role.ec2_role.name
+}
+
+# EC2에 대한 S3 접근 정책
+resource "aws_iam_policy" "s3_access" {
+  name        = "s3_access_for_ai_infra"
+  description = "Allow S3 access for model storage"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -250,58 +154,134 @@ resource "aws_iam_policy" "ai_s3_access" {
       {
         Action = [
           "s3:GetObject",
-          "s3:PutObject",
-          "s3:ListBucket"
+          "s3:ListBucket",
         ]
         Effect   = "Allow"
-        Resource = [
-          aws_s3_bucket.ai_model_bucket.arn,
-          "${aws_s3_bucket.ai_model_bucket.arn}/*"
-        ]
+        Resource = "*"
       }
     ]
   })
 }
 
-# IAM 역할에 정책 연결
-resource "aws_iam_role_policy_attachment" "ai_s3_access_attachment" {
-  role       = aws_iam_role.ai_ec2_role.name
-  policy_arn = aws_iam_policy.ai_s3_access.arn
+# IAM 정책 연결
+resource "aws_iam_role_policy_attachment" "s3_policy_attachment" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.s3_access.arn
 }
 
-# 인스턴스 프로파일
-resource "aws_iam_instance_profile" "ai_instance_profile" {
-  name = "ai-llama-instance-profile"
-  role = aws_iam_role.ai_ec2_role.name
-}
-
-# EC2 인스턴스에 프로파일 연결
-resource "aws_instance" "ai_server_with_profile" {
-  ami                    = aws_instance.ai_server.ami
-  instance_type          = aws_instance.ai_server.instance_type
-  subnet_id              = aws_instance.ai_server.subnet_id
-  vpc_security_group_ids = aws_instance.ai_server.vpc_security_group_ids
-  key_name               = aws_instance.ai_server.key_name
-  iam_instance_profile   = aws_iam_instance_profile.ai_instance_profile.name
+# GPU 인스턴스 생성
+resource "aws_instance" "gpu_instance" {
+  ami                    = "ami-0c55b159cbfafe1f0"  # Ubuntu 20.04 with GPU drivers (사용 가능한 AMI로 변경 필요)
+  instance_type          = "g5.2xlarge"             # NVIDIA A10G GPU 장착 인스턴스
+  key_name               = "ai-infra-key"           # 실제 키 페어 이름으로 변경 필요
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.allow_ssh_http.id]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
   root_block_device {
+    volume_size           = 100
     volume_type           = "gp3"
-    volume_size           = 50
     delete_on_termination = true
   }
 
+  user_data = <<-EOF
+              #!/bin/bash
+              apt-get update
+              apt-get install -y git python3-pip
+              pip3 install torch torchvision torchaudio
+              
+              # 코드 클론
+              git clone https://github.com/hyungtakChoi/air-workload-mz-icon.git /home/ubuntu/app
+              
+              # 필요 패키지 설치
+              cd /home/ubuntu/app
+              pip3 install -r requirements.txt
+              
+              # 서비스 등록
+              cat > /etc/systemd/system/aiapp.service << 'EOL'
+              [Unit]
+              Description=AI Car Sales Application
+              After=network.target
+              
+              [Service]
+              User=ubuntu
+              WorkingDirectory=/home/ubuntu/app
+              ExecStart=/usr/bin/python3 /home/ubuntu/app/app.py
+              Restart=always
+              
+              [Install]
+              WantedBy=multi-user.target
+              EOL
+              
+              systemctl daemon-reload
+              systemctl enable aiapp
+              systemctl start aiapp
+              EOF
+
   tags = {
-    Name        = "ai-llama-server-with-profile"
+    Name        = "ai-infra-gpu-server"
     project     = "ai-infra"
     environment = "production"
   }
-  
-  # ai_server 리소스를 대체
-  lifecycle {
-    create_before_destroy = true
+}
+
+# S3 버킷 생성 (모델 저장용)
+resource "aws_s3_bucket" "model_bucket" {
+  bucket = "ai-infra-model-storage-bucket"
+
+  tags = {
+    Name        = "AI Model Storage"
+    project     = "ai-infra"
+    environment = "production"
   }
 }
 
-# 예약 인스턴스 권장 (비용 절감)
-# 실제 구매는 AWS 콘솔에서 수행해야 합니다.
-# g5.2xlarge, ap-northeast-2, 1년 부분 선결제 예약 권장
+# 버킷 액세스 제어
+resource "aws_s3_bucket_ownership_controls" "model_bucket_ownership" {
+  bucket = aws_s3_bucket.model_bucket.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_acl" "model_bucket_acl" {
+  bucket = aws_s3_bucket.model_bucket.id
+  acl    = "private"
+
+  depends_on = [aws_s3_bucket_ownership_controls.model_bucket_ownership]
+}
+
+# CloudWatch 경보 (GPU 사용률)
+resource "aws_cloudwatch_metric_alarm" "gpu_utilization_alarm" {
+  alarm_name          = "high-gpu-utilization"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "GPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "90"
+  alarm_description   = "This alarm monitors EC2 GPU utilization"
+  alarm_actions       = []
+
+  dimensions = {
+    InstanceId = aws_instance.gpu_instance.id
+  }
+
+  tags = {
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# 출력 정보
+output "instance_public_ip" {
+  description = "Public IP of the GPU instance"
+  value       = aws_instance.gpu_instance.public_ip
+}
+
+output "model_bucket_name" {
+  description = "S3 bucket for model storage"
+  value       = aws_s3_bucket.model_bucket.bucket
+}
