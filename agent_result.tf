@@ -1,214 +1,247 @@
-terraform {
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 4.0"
-    }
-  }
+provider "aws" {
+  region = "ap-northeast-2"
 }
 
-provider "google" {
-  project = "my-project-id"  # 실제 프로젝트 ID로 변경 필요
-  region  = "asia-northeast3"  # 서울 리전
-  zone    = "asia-northeast3-a"
-}
+# VPC 구성
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
-# VPC 네트워크
-resource "google_compute_network" "vpc_network" {
-  name                    = "ai-infra-vpc"
-  auto_create_subnetworks = false
-}
-
-# 서브넷
-resource "google_compute_subnetwork" "subnet" {
-  name          = "ai-infra-subnet"
-  ip_cidr_range = "10.0.0.0/24"
-  region        = "asia-northeast3"
-  network       = google_compute_network.vpc_network.id
-}
-
-# 방화벽 규칙 - SSH 접속 허용
-resource "google_compute_firewall" "allow_ssh" {
-  name    = "allow-ssh"
-  network = google_compute_network.vpc_network.name
-
-  allow {
-    protocol = "tcp"
-    ports    = ["22"]
-  }
-
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["ssh"]
-}
-
-# 방화벽 규칙 - 애플리케이션 포트 허용
-resource "google_compute_firewall" "allow_app" {
-  name    = "allow-app"
-  network = google_compute_network.vpc_network.name
-
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "8080"]  # 애플리케이션 포트
-  }
-
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["app"]
-}
-
-# 인스턴스 템플릿
-resource "google_compute_instance_template" "instance_template" {
-  name_prefix  = "ai-infra-template-"
-  machine_type = "g2-standard-8"  # GPU가 있는 인스턴스 유형
-  tags         = ["ssh", "app"]
-
-  disk {
-    source_image = "debian-cloud/debian-11"
-    auto_delete  = true
-    boot         = true
-    disk_size_gb = 100  # LLaMA 모델을 위한 충분한 스토리지
-  }
-
-  # GPU 설정
-  guest_accelerator {
-    type  = "nvidia-l4"
-    count = 1
-  }
-
-  scheduling {
-    automatic_restart   = true
-    on_host_maintenance = "TERMINATE"  # GPU 인스턴스는 TERMINATE 필요
-  }
-
-  network_interface {
-    subnetwork = google_compute_subnetwork.subnet.id
-    access_config {
-      # 기본 외부 IP 할당
-    }
-  }
-
-  metadata = {
-    startup-script = <<-EOT
-      #!/bin/bash
-      apt-get update
-      apt-get install -y python3 python3-pip git
-      
-      # NVIDIA 드라이버 및 CUDA 설치
-      curl -O https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
-      dpkg -i cuda-keyring_1.0-1_all.deb
-      apt-get update
-      apt-get -y install cuda-drivers
-      apt-get -y install cuda
-      
-      # 프로젝트 클론 및 의존성 설치
-      cd /home
-      git clone https://github.com/hyungtakChoi/air-workload-mz-icon.git
-      cd air-workload-mz-icon
-      pip3 install -r requirements.txt
-    EOT
-  }
-
-  service_account {
-    scopes = [
-      "https://www.googleapis.com/auth/devstorage.read_only",
-      "https://www.googleapis.com/auth/logging.write",
-      "https://www.googleapis.com/auth/monitoring.write",
-      "https://www.googleapis.com/auth/servicecontrol",
-      "https://www.googleapis.com/auth/service.management.readonly",
-      "https://www.googleapis.com/auth/trace.append",
-    ]
-  }
-
-  labels = {
+  tags = {
+    Name        = "ai-car-sales-vpc"
     project     = "ai-infra"
     environment = "production"
   }
+}
 
-  lifecycle {
-    create_before_destroy = true
+# 퍼블릭 서브넷
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-northeast-2a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name        = "ai-car-sales-public-subnet"
+    project     = "ai-infra"
+    environment = "production"
   }
 }
 
-# 관리형 인스턴스 그룹
-resource "google_compute_instance_group_manager" "instance_group" {
-  name               = "ai-infra-instance-group"
-  base_instance_name = "ai-infra-vm"
-  zone               = "asia-northeast3-a"
-  target_size        = 1  # 초기 인스턴스 수
+# 프라이빗 서브넷
+resource "aws_subnet" "private" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "ap-northeast-2a"
 
-  version {
-    instance_template = google_compute_instance_template.instance_template.id
-  }
-
-  named_port {
-    name = "http"
-    port = 80
-  }
-
-  auto_healing_policies {
-    health_check      = google_compute_health_check.autohealing.id
-    initial_delay_sec = 300
+  tags = {
+    Name        = "ai-car-sales-private-subnet"
+    project     = "ai-infra"
+    environment = "production"
   }
 }
 
-# 헬스 체크
-resource "google_compute_health_check" "autohealing" {
-  name                = "autohealing-health-check"
-  check_interval_sec  = 5
-  timeout_sec         = 5
-  healthy_threshold   = 2
-  unhealthy_threshold = 10
+# 인터넷 게이트웨이
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
 
-  http_health_check {
-    request_path = "/health"
-    port         = "80"
+  tags = {
+    Name        = "ai-car-sales-igw"
+    project     = "ai-infra"
+    environment = "production"
   }
 }
 
-# Cloud Storage 버킷 (모델 저장용)
-resource "google_storage_bucket" "model_bucket" {
-  name          = "ai-infra-model-bucket"  # 전역적으로 고유한 이름으로 변경 필요
-  location      = "ASIA-NORTHEAST3"
-  storage_class = "STANDARD"
+# 라우팅 테이블 (퍼블릭)
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+
+  tags = {
+    Name        = "ai-car-sales-public-rt"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# 서브넷과 라우팅 테이블 연결
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+# 보안 그룹
+resource "aws_security_group" "app_sg" {
+  name        = "ai-car-sales-sg"
+  description = "Security group for AI car sales application"
+  vpc_id      = aws_vpc.main.id
+
+  # SSH 접속용
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # 웹 서비스용 (HTTP)
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # 웹 서비스용 (HTTPS)
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # API 서비스용
+  ingress {
+    from_port   = 8000
+    to_port     = 8000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # 모든 아웃바운드 트래픽 허용
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "ai-car-sales-sg"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# 서비스 인스턴스 (GPU 인스턴스)
+resource "aws_instance" "app_server" {
+  ami                    = "ami-0c9c942bd7bf113a2" # Amazon Linux 2023 AMI
+  instance_type          = "g5.2xlarge"            # GPU 인스턴스
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.app_sg.id]
+  key_name               = "ai-car-sales-key"      # 사전에 생성한 키 페어 이름
+
+  root_block_device {
+    volume_size = 100
+    volume_type = "gp3"
+    tags = {
+      Name        = "ai-car-sales-root-volume"
+      project     = "ai-infra"
+      environment = "production"
+    }
+  }
+
+  tags = {
+    Name        = "ai-car-sales-server"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# 탄력적 IP
+resource "aws_eip" "app_eip" {
+  instance = aws_instance.app_server.id
+  domain   = "vpc"
+
+  tags = {
+    Name        = "ai-car-sales-eip"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# S3 버킷 (모델 및 데이터 저장용)
+resource "aws_s3_bucket" "model_bucket" {
+  bucket = "ai-car-sales-models"
+
+  tags = {
+    Name        = "ai-car-sales-models"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# S3 버킷 퍼블릭 액세스 차단
+resource "aws_s3_bucket_public_access_block" "model_bucket_public_access" {
+  bucket = aws_s3_bucket.model_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# CloudWatch 알람 (CPU 사용률)
+resource "aws_cloudwatch_metric_alarm" "cpu_alarm" {
+  alarm_name          = "ai-car-sales-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "This metric monitors ec2 cpu utilization"
   
-  uniform_bucket_level_access = true
+  dimensions = {
+    InstanceId = aws_instance.app_server.id
+  }
 
-  labels = {
+  tags = {
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 부하 분산기
-resource "google_compute_global_address" "lb_ip" {
-  name = "ai-infra-lb-ip"
-}
-
-resource "google_compute_backend_service" "backend" {
-  name        = "ai-infra-backend"
-  port_name   = "http"
-  protocol    = "HTTP"
-  timeout_sec = 10
-
-  backend {
-    group = google_compute_instance_group_manager.instance_group.instance_group
+# CloudWatch 알람 (메모리 사용률)
+resource "aws_cloudwatch_metric_alarm" "memory_alarm" {
+  alarm_name          = "ai-car-sales-high-memory"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "mem_used_percent"
+  namespace           = "CWAgent"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "This metric monitors memory utilization"
+  
+  dimensions = {
+    InstanceId = aws_instance.app_server.id
   }
 
-  health_checks = [google_compute_health_check.autohealing.id]
+  tags = {
+    project     = "ai-infra"
+    environment = "production"
+  }
 }
 
-resource "google_compute_url_map" "url_map" {
-  name            = "ai-infra-url-map"
-  default_service = google_compute_backend_service.backend.id
+# 출력 설정
+output "instance_id" {
+  description = "ID of the EC2 instance"
+  value       = aws_instance.app_server.id
 }
 
-resource "google_compute_target_http_proxy" "http_proxy" {
-  name    = "ai-infra-http-proxy"
-  url_map = google_compute_url_map.url_map.id
+output "instance_public_ip" {
+  description = "Public IP address of the EC2 instance"
+  value       = aws_eip.app_eip.public_ip
 }
 
-resource "google_compute_global_forwarding_rule" "forwarding_rule" {
-  name       = "ai-infra-forwarding-rule"
-  target     = google_compute_target_http_proxy.http_proxy.id
-  port_range = "80"
-  ip_address = google_compute_global_address.lb_ip.address
+output "model_bucket_name" {
+  description = "Name of the S3 bucket for model storage"
+  value       = aws_s3_bucket.model_bucket.id
 }
