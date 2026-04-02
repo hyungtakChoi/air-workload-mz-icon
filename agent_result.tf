@@ -1,6 +1,5 @@
-# AWS 공급자 설정
 provider "aws" {
-  region = "ap-northeast-2"  # 서울 리전
+  region = "ap-northeast-2"
 }
 
 # VPC 생성
@@ -10,79 +9,79 @@ resource "aws_vpc" "main" {
   enable_dns_hostnames = true
 
   tags = {
-    Name        = "ai-llama-vpc"
+    Name        = "ai-infra-vpc"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 인터넷 게이트웨이
-resource "aws_internet_gateway" "main" {
+# 인터넷 게이트웨이 생성
+resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
 
   tags = {
-    Name        = "ai-llama-igw"
+    Name        = "ai-infra-igw"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 퍼블릭 서브넷
+# 퍼블릭 서브넷 생성
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
-  availability_zone       = "ap-northeast-2a"
   map_public_ip_on_launch = true
+  availability_zone       = "ap-northeast-2a"
 
   tags = {
-    Name        = "ai-llama-public-subnet"
+    Name        = "ai-infra-public-subnet"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 프라이빗 서브넷
+# 프라이빗 서브넷 생성
 resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.2.0/24"
   availability_zone = "ap-northeast-2a"
 
   tags = {
-    Name        = "ai-llama-private-subnet"
+    Name        = "ai-infra-private-subnet"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 라우팅 테이블 - 퍼블릭
+# 라우팅 테이블 생성
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
+    gateway_id = aws_internet_gateway.igw.id
   }
 
   tags = {
-    Name        = "ai-llama-public-rt"
+    Name        = "ai-infra-public-rt"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 라우팅 테이블 연결 - 퍼블릭
+# 라우팅 테이블 연결
 resource "aws_route_table_association" "public" {
   subnet_id      = aws_subnet.public.id
   route_table_id = aws_route_table.public.id
 }
 
-# 보안 그룹 - GPU 인스턴스
-resource "aws_security_group" "gpu_instance" {
-  name        = "ai-llama-sg"
-  description = "Security group for LLaMA model inference"
+# 보안 그룹 생성
+resource "aws_security_group" "instance_sg" {
+  name        = "ai-infra-sg"
+  description = "Allow SSH and application traffic"
   vpc_id      = aws_vpc.main.id
 
-  # SSH 접속
+  # SSH 접속 허용
   ingress {
     from_port   = 22
     to_port     = 22
@@ -91,16 +90,34 @@ resource "aws_security_group" "gpu_instance" {
     description = "SSH access"
   }
 
-  # API 엔드포인트
+  # 웹 서비스 포트 허용
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTP access"
+  }
+
+  # HTTPS 허용
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS access"
+  }
+
+  # 모델 서비스 API 포트 (예시)
   ingress {
     from_port   = 8000
     to_port     = 8000
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "API endpoint"
+    description = "API port"
   }
 
-  # 아웃바운드 트래픽 허용
+  # 모든 아웃바운드 트래픽 허용
   egress {
     from_port   = 0
     to_port     = 0
@@ -109,158 +126,81 @@ resource "aws_security_group" "gpu_instance" {
   }
 
   tags = {
-    Name        = "ai-llama-security-group"
+    Name        = "ai-infra-sg"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# S3 버킷 - 모델 저장용
-resource "aws_s3_bucket" "model_storage" {
-  bucket = "ai-llama-model-storage-${formatdate("YYYYMMDDhhmmss", timestamp())}"
-  
-  tags = {
-    Name        = "ai-llama-model-storage"
-    project     = "ai-infra"
-    environment = "production"
-  }
+# EC2 인스턴스 키 페어 생성 
+resource "aws_key_pair" "deployer" {
+  key_name   = "ai-infra-key"
+  public_key = file("~/.ssh/id_rsa.pub")  # 실제 배포 시 공개 키 경로 설정 필요
 }
 
-# S3 버킷 버전 관리 설정
-resource "aws_s3_bucket_versioning" "model_storage" {
-  bucket = aws_s3_bucket.model_storage.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# S3 버킷 서버 측 암호화 설정
-resource "aws_s3_bucket_server_side_encryption_configuration" "model_storage" {
-  bucket = aws_s3_bucket.model_storage.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-# IAM 역할 - EC2 인스턴스용
-resource "aws_iam_role" "ec2_role" {
-  name = "ai-llama-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# IAM 정책 - S3 접근용
-resource "aws_iam_policy" "s3_access" {
-  name        = "ai-llama-s3-access"
-  description = "Allow S3 access for model storage"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:ListBucket"
-        ]
-        Effect   = "Allow"
-        Resource = [
-          aws_s3_bucket.model_storage.arn,
-          "${aws_s3_bucket.model_storage.arn}/*"
-        ]
-      }
-    ]
-  })
-}
-
-# IAM 정책 연결
-resource "aws_iam_role_policy_attachment" "s3_access_attach" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = aws_iam_policy.s3_access.arn
-}
-
-# EC2 인스턴스 프로파일
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "ai-llama-ec2-profile"
-  role = aws_iam_role.ec2_role.name
-}
-
-# GPU 인스턴스 생성 (g5.2xlarge - A10G GPU)
+# GPU 인스턴스 생성
 resource "aws_instance" "gpu_instance" {
-  ami                    = "ami-0c9c942bd7bf113a2"  # Amazon Linux 2023 AMI with NVIDIA drivers
-  instance_type          = "g5.2xlarge"             # 24GB GPU Memory, 32GB RAM
+  ami                    = "ami-0f3a440bbcff3d043"  # Amazon Linux 2 with Deep Learning AMI
+  instance_type          = "g5.2xlarge"  # A10G GPU 1개
+  key_name               = aws_key_pair.deployer.key_name
   subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.gpu_instance.id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
-  key_name               = "llama-key-pair"         # 사전에 생성된 키 페어 이름
+  vpc_security_group_ids = [aws_security_group.instance_sg.id]
 
   root_block_device {
-    volume_size           = 100  # 100GB 루트 볼륨
     volume_type           = "gp3"
+    volume_size           = 100
     delete_on_termination = true
   }
 
-  user_data = <<-EOF
-              #!/bin/bash
-              yum update -y
-              yum install -y git python3 python3-pip
-              pip3 install --upgrade pip
-              pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-              pip3 install transformers accelerate
-              
-              # 코드 저장소 복제
-              git clone https://github.com/hyungtakChoi/air-workload-mz-icon.git /home/ec2-user/app
-              chown -R ec2-user:ec2-user /home/ec2-user/app
-              
-              # 모델 다운로드 디렉토리 생성
-              mkdir -p /home/ec2-user/models
-              chown -R ec2-user:ec2-user /home/ec2-user/models
-              
-              # 모델 파일 다운로드 (S3에서)
-              aws s3 cp s3://${aws_s3_bucket.model_storage.id}/models/ /home/ec2-user/models/ --recursive
-              EOF
-
   tags = {
-    Name        = "ai-llama-gpu-instance"
+    Name        = "ai-infra-gpu-server"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# Elastic IP
-resource "aws_eip" "gpu_instance" {
-  instance = aws_instance.gpu_instance.id
-  domain   = "vpc"
+# EBS 볼륨 생성 (모델 저장용)
+resource "aws_ebs_volume" "model_storage" {
+  availability_zone = "ap-northeast-2a"
+  size              = 200
+  type              = "gp3"
+  iops              = 3000
+  throughput        = 125
 
   tags = {
-    Name        = "ai-llama-eip"
+    Name        = "ai-infra-model-storage"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# CloudWatch 알람 - CPU 사용량
-resource "aws_cloudwatch_metric_alarm" "high_cpu" {
-  alarm_name          = "ai-llama-high-cpu"
+# EBS 볼륨 인스턴스에 연결
+resource "aws_volume_attachment" "model_storage_attachment" {
+  device_name = "/dev/sdf"
+  volume_id   = aws_ebs_volume.model_storage.id
+  instance_id = aws_instance.gpu_instance.id
+}
+
+# Elastic IP 할당
+resource "aws_eip" "gpu_instance_eip" {
+  vpc = true
+
+  tags = {
+    Name        = "ai-infra-eip"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# Elastic IP 연결
+resource "aws_eip_association" "eip_assoc" {
+  instance_id   = aws_instance.gpu_instance.id
+  allocation_id = aws_eip.gpu_instance_eip.id
+}
+
+# CloudWatch 알람 설정 - CPU 사용률
+resource "aws_cloudwatch_metric_alarm" "cpu_alarm" {
+  alarm_name          = "ai-infra-high-cpu-alarm"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
@@ -269,6 +209,7 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   statistic           = "Average"
   threshold           = 80
   alarm_description   = "This metric monitors ec2 cpu utilization"
+  alarm_actions       = []  # 실제 배포 시 SNS 주제 ARN 설정 필요
   
   dimensions = {
     InstanceId = aws_instance.gpu_instance.id
@@ -280,18 +221,19 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   }
 }
 
-# CloudWatch 알람 - 메모리 부족
-resource "aws_cloudwatch_metric_alarm" "memory_low" {
-  alarm_name          = "ai-llama-low-memory"
-  comparison_operator = "LessThanThreshold"
+# CloudWatch 알람 설정 - 메모리 사용률
+resource "aws_cloudwatch_metric_alarm" "memory_alarm" {
+  alarm_name          = "ai-infra-high-memory-alarm"
+  comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "MemoryAvailable"
+  metric_name         = "mem_used_percent"
   namespace           = "CWAgent"
   period              = 300
   statistic           = "Average"
-  threshold           = 2000000000  # 2GB
-  alarm_description   = "This metric monitors available memory"
-  
+  threshold           = 80
+  alarm_description   = "This metric monitors memory utilization"
+  alarm_actions       = []  # 실제 배포 시 SNS 주제 ARN 설정 필요
+
   dimensions = {
     InstanceId = aws_instance.gpu_instance.id
   }
@@ -302,18 +244,48 @@ resource "aws_cloudwatch_metric_alarm" "memory_low" {
   }
 }
 
-# 출력 정보
+# S3 버킷 생성 (모델 가중치 및 데이터 저장용)
+resource "aws_s3_bucket" "model_bucket" {
+  bucket = "ai-infra-model-storage-bucket"
+
+  tags = {
+    Name        = "AI Infra Model Storage"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# S3 버킷 버전 관리 설정
+resource "aws_s3_bucket_versioning" "model_bucket_versioning" {
+  bucket = aws_s3_bucket.model_bucket.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# S3 버킷 서버 사이드 암호화 설정
+resource "aws_s3_bucket_server_side_encryption_configuration" "model_bucket_encryption" {
+  bucket = aws_s3_bucket.model_bucket.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# 출력 값 정의
 output "instance_id" {
-  description = "ID of the GPU instance"
+  description = "ID of the GPU EC2 instance"
   value       = aws_instance.gpu_instance.id
 }
 
 output "instance_public_ip" {
-  description = "Public IP of the GPU instance"
-  value       = aws_eip.gpu_instance.public_ip
+  description = "Public IP of the GPU EC2 instance"
+  value       = aws_eip.gpu_instance_eip.public_ip
 }
 
-output "model_storage_bucket" {
-  description = "S3 bucket for model storage"
-  value       = aws_s3_bucket.model_storage.id
+output "model_bucket_name" {
+  description = "Name of S3 bucket for model storage"
+  value       = aws_s3_bucket.model_bucket.bucket
 }
