@@ -1,61 +1,61 @@
 provider "aws" {
-  region = "ap-northeast-2"
+  region = "ap-northeast-2"  # Seoul region
 }
 
 # VPC 구성
-resource "aws_vpc" "ai_vpc" {
+resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
 
   tags = {
-    Name        = "ai-infra-vpc"
+    Name        = "llama-vpc"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 공개 서브넷 구성
-resource "aws_subnet" "public_subnet" {
-  vpc_id                  = aws_vpc.ai_vpc.id
+# 인터넷 게이트웨이 생성
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name        = "llama-igw"
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# 퍼블릭 서브넷 생성
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-2a"
   map_public_ip_on_launch = true
 
   tags = {
-    Name        = "ai-infra-public-subnet"
+    Name        = "llama-public-subnet"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 프라이빗 서브넷 구성
-resource "aws_subnet" "private_subnet" {
-  vpc_id            = aws_vpc.ai_vpc.id
+# 프라이빗 서브넷 생성
+resource "aws_subnet" "private" {
+  vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.2.0/24"
   availability_zone = "ap-northeast-2a"
 
   tags = {
-    Name        = "ai-infra-private-subnet"
+    Name        = "llama-private-subnet"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# 인터넷 게이트웨이
-resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.ai_vpc.id
-
-  tags = {
-    Name        = "ai-infra-igw"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# 라우팅 테이블 - 공개
-resource "aws_route_table" "public_rt" {
-  vpc_id = aws_vpc.ai_vpc.id
+# 라우팅 테이블 구성
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
 
   route {
     cidr_block = "0.0.0.0/0"
@@ -63,40 +63,25 @@ resource "aws_route_table" "public_rt" {
   }
 
   tags = {
-    Name        = "ai-infra-public-rt"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# 라우팅 테이블 - 프라이빗
-resource "aws_route_table" "private_rt" {
-  vpc_id = aws_vpc.ai_vpc.id
-
-  tags = {
-    Name        = "ai-infra-private-rt"
+    Name        = "llama-public-rt"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
 # 라우팅 테이블 연결
-resource "aws_route_table_association" "public_rta" {
-  subnet_id      = aws_subnet.public_subnet.id
-  route_table_id = aws_route_table.public_rt.id
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
 }
 
-resource "aws_route_table_association" "private_rta" {
-  subnet_id      = aws_subnet.private_subnet.id
-  route_table_id = aws_route_table.private_rt.id
-}
+# 보안 그룹 생성
+resource "aws_security_group" "llama_sg" {
+  name        = "llama-security-group"
+  description = "Security group for LLaMA service"
+  vpc_id      = aws_vpc.main.id
 
-# 보안 그룹
-resource "aws_security_group" "app_sg" {
-  name        = "ai-infra-app-sg"
-  description = "Allow HTTP, HTTPS and SSH traffic"
-  vpc_id      = aws_vpc.ai_vpc.id
-
+  # SSH 접속 허용
   ingress {
     from_port   = 22
     to_port     = 22
@@ -104,6 +89,7 @@ resource "aws_security_group" "app_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # 웹 서비스 포트 허용
   ingress {
     from_port   = 80
     to_port     = 80
@@ -118,7 +104,7 @@ resource "aws_security_group" "app_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # API 서버를 위한 포트
+  # 모델 서빙 API 포트 (예시)
   ingress {
     from_port   = 8000
     to_port     = 8000
@@ -134,111 +120,114 @@ resource "aws_security_group" "app_sg" {
   }
 
   tags = {
-    Name        = "ai-infra-app-sg"
+    Name        = "llama-sg"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# EBS 볼륨
-resource "aws_ebs_volume" "app_data" {
-  availability_zone = "ap-northeast-2a"
-  size              = 100
-  type              = "gp3"
+# IAM 역할 생성
+resource "aws_iam_role" "llama_role" {
+  name = "llama-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      },
+    ]
+  })
 
   tags = {
-    Name        = "ai-infra-app-data"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# G5 인스턴스 (NVIDIA A10G GPU)
-resource "aws_instance" "ai_app_server" {
-  ami                    = "ami-0c9c942bd7bf113a2" # Amazon Linux 2 AMI (HVM), SSD Volume Type
-  instance_type          = "g5.2xlarge"
-  key_name               = "ai-infra-key"
-  subnet_id              = aws_subnet.public_subnet.id
-  vpc_security_group_ids = [aws_security_group.app_sg.id]
+# IAM 정책 연결 - S3 접근
+resource "aws_iam_role_policy_attachment" "s3_access" {
+  role       = aws_iam_role.llama_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+}
+
+# IAM 인스턴스 프로파일 생성
+resource "aws_iam_instance_profile" "llama_profile" {
+  name = "llama-profile"
+  role = aws_iam_role.llama_role.name
+}
+
+# EC2 인스턴스 생성 (GPU 인스턴스 - g5.2xlarge)
+resource "aws_instance" "llama_server" {
+  ami                    = "ami-0c9c942bd7bf113a2"  # Ubuntu 22.04 with GPU support
+  instance_type          = "g5.2xlarge"             # A10G GPU 1개, 32GB RAM
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.llama_sg.id]
+  key_name               = "llama-key"              # 키페어 이름 (미리 생성 필요)
+  iam_instance_profile   = aws_iam_instance_profile.llama_profile.name
 
   root_block_device {
-    volume_size = 100
+    volume_size = 100  # 100GB 스토리지
     volume_type = "gp3"
   }
 
+  user_data = <<-EOF
+              #!/bin/bash
+              apt-get update
+              apt-get install -y python3-pip git
+              pip3 install torch torchvision torchaudio
+              
+              # NVIDIA 드라이버 및 CUDA 설치
+              apt-get install -y nvidia-driver-525 nvidia-cuda-toolkit
+              
+              # 애플리케이션 코드 클론
+              git clone https://github.com/hyungtakChoi/air-workload-mz-icon.git /home/ubuntu/llama-app
+              
+              # 필요한 Python 패키지 설치
+              cd /home/ubuntu/llama-app
+              pip3 install -r requirements.txt || echo "No requirements.txt found"
+              
+              # 모델 다운로드 (예시)
+              mkdir -p /home/ubuntu/models
+              # 실제 모델 다운로드 커맨드는 별도로 구성 필요
+              EOF
+
   tags = {
-    Name        = "ai-infra-app-server"
+    Name        = "llama-server"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# EBS 볼륨 연결
-resource "aws_volume_attachment" "app_data_att" {
-  device_name = "/dev/sdf"
-  volume_id   = aws_ebs_volume.app_data.id
-  instance_id = aws_instance.ai_app_server.id
-}
-
-# 탄력적 IP 할당
-resource "aws_eip" "app_eip" {
-  instance = aws_instance.ai_app_server.id
-  domain   = "vpc"
+# S3 버킷 생성 - 모델 저장용
+resource "aws_s3_bucket" "model_storage" {
+  bucket = "llama-model-storage-unique-name"  # 실제 배포 시 고유한 이름으로 변경 필요
 
   tags = {
-    Name        = "ai-infra-app-eip"
+    Name        = "llama-model-storage"
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-# S3 버킷 (모델 저장용)
-resource "aws_s3_bucket" "model_bucket" {
-  bucket = "ai-infra-model-storage"
-
-  tags = {
-    Name        = "ai-infra-model-storage"
-    project     = "ai-infra"
-    environment = "production"
+# S3 버킷 버전 관리 설정
+resource "aws_s3_bucket_versioning" "model_storage_versioning" {
+  bucket = aws_s3_bucket.model_storage.id
+  
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
-# 버킷 공개 액세스 차단
-resource "aws_s3_bucket_public_access_block" "model_bucket_block" {
-  bucket = aws_s3_bucket.model_bucket.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# 버킷 서버 사이드 암호화 설정
-resource "aws_s3_bucket_server_side_encryption_configuration" "model_bucket_encryption" {
-  bucket = aws_s3_bucket.model_bucket.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-# CloudWatch 알람 (CPU 사용률)
-resource "aws_cloudwatch_metric_alarm" "cpu_alarm" {
-  alarm_name          = "ai-infra-cpu-alarm"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = "2"
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = "120"
-  statistic           = "Average"
-  threshold           = "80"
-  alarm_description   = "This alarm monitors EC2 CPU utilization"
-
-  dimensions = {
-    InstanceId = aws_instance.ai_app_server.id
-  }
+# CloudWatch 로그 그룹 생성
+resource "aws_cloudwatch_log_group" "llama_logs" {
+  name = "/llama/application"
+  
+  retention_in_days = 30
 
   tags = {
     project     = "ai-infra"
@@ -246,24 +235,13 @@ resource "aws_cloudwatch_metric_alarm" "cpu_alarm" {
   }
 }
 
-# CloudWatch 알람 (메모리 사용률)
-resource "aws_cloudwatch_metric_alarm" "memory_alarm" {
-  alarm_name          = "ai-infra-memory-alarm"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = "2"
-  metric_name         = "mem_used_percent"
-  namespace           = "CWAgent"
-  period              = "120"
-  statistic           = "Average"
-  threshold           = "80"
-  alarm_description   = "This alarm monitors EC2 memory utilization"
+# 출력 변수
+output "instance_public_ip" {
+  value = aws_instance.llama_server.public_ip
+  description = "The public IP address of the LLaMA server"
+}
 
-  dimensions = {
-    InstanceId = aws_instance.ai_app_server.id
-  }
-
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
+output "model_storage_bucket" {
+  value = aws_s3_bucket.model_storage.bucket_domain_name
+  description = "The domain name of the model storage bucket"
 }
