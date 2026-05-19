@@ -71,7 +71,7 @@ resource "aws_subnet" "public_c" {
   }
 }
 
-# Private Subnets (GPU 추론 서버, RDS)
+# Private Subnets (GPU 추론 서버, RDS, ElastiCache)
 resource "aws_subnet" "private_a" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.11.0/24"
@@ -92,7 +92,7 @@ resource "aws_subnet" "private_c" {
   }
 }
 
-# NAT Gateway (Private → Internet)
+# NAT Gateway
 resource "aws_eip" "nat" {
   domain = "vpc"
   tags = {
@@ -260,9 +260,29 @@ resource "aws_security_group" "rds" {
   }
 }
 
+# ElastiCache 보안 그룹
+resource "aws_security_group" "redis" {
+  name        = "used-car-ai-redis-sg"
+  description = "ElastiCache Redis Security Group"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id]
+  }
+
+  tags = {
+    Name = "used-car-ai-redis-sg"
+  }
+}
+
 # ============================================================
 # 3. S3 버킷 (LLaMA 모델 가중치 저장)
 # ============================================================
+
+data "aws_caller_identity" "current" {}
 
 resource "aws_s3_bucket" "model_weights" {
   bucket = "used-car-ai-llama-model-weights-${data.aws_caller_identity.current.account_id}"
@@ -296,8 +316,6 @@ resource "aws_s3_bucket_public_access_block" "model_weights" {
   restrict_public_buckets = true
 }
 
-data "aws_caller_identity" "current" {}
-
 # ============================================================
 # 4. IAM Role (EC2 → S3 접근)
 # ============================================================
@@ -322,8 +340,8 @@ resource "aws_iam_role_policy" "ec2_s3_policy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:ListBucket"]
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:ListBucket"]
       Resource = [
         aws_s3_bucket.model_weights.arn,
         "${aws_s3_bucket.model_weights.arn}/*"
@@ -375,9 +393,7 @@ resource "aws_spot_instance_request" "gpu_inference" {
   user_data = base64encode(<<-EOF
     #!/bin/bash
     set -e
-    # 모델 가중치 S3에서 다운로드
     aws s3 sync s3://${aws_s3_bucket.model_weights.bucket}/llama-model /opt/llama-model
-    # LLaMA 추론 서버 실행
     cd /opt/app
     pip install -r requirements.txt
     python llama_inference.py --host 0.0.0.0 --port 8080 --model-path /opt/llama-model &
@@ -433,8 +449,8 @@ resource "aws_launch_template" "api" {
     yum install -y python3 python3-pip
     cd /opt/app
     pip3 install -r requirements.txt
-    GPU_ENDPOINT="http://${aws_spot_instance_request.gpu_inference.private_ip}:8080"
-    export GPU_INFERENCE_URL=$GPU_ENDPOINT
+    export GPU_INFERENCE_URL="http://${aws_spot_instance_request.gpu_inference.private_ip}:8080"
+    export REDIS_URL="${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379"
     python3 main.py --host 0.0.0.0 --port 8000 &
     EOF
   )
@@ -490,7 +506,6 @@ resource "aws_autoscaling_group" "api" {
   }
 }
 
-# Auto Scaling 정책 (CPU 기반)
 resource "aws_autoscaling_policy" "api_scale_out" {
   name                   = "used-car-ai-api-scale-out"
   autoscaling_group_name = aws_autoscaling_group.api.name
@@ -568,14 +583,14 @@ resource "aws_db_subnet_group" "main" {
 }
 
 resource "aws_db_instance" "postgres" {
-  identifier             = "used-car-ai-postgres"
-  engine                 = "postgres"
-  engine_version         = "15.4"
-  instance_class         = "db.t3.medium"
-  allocated_storage      = 50
-  max_allocated_storage  = 200
-  storage_type           = "gp3"
-  storage_encrypted      = true
+  identifier            = "used-car-ai-postgres"
+  engine                = "postgres"
+  engine_version        = "15.4"
+  instance_class        = "db.t3.medium"
+  allocated_storage     = 50
+  max_allocated_storage = 200
+  storage_type          = "gp3"
+  storage_encrypted     = true
 
   db_name  = "usedcarai"
   username = "dbadmin"
@@ -584,10 +599,9 @@ resource "aws_db_instance" "postgres" {
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.rds.id]
 
-  backup_retention_period = 7
-  backup_window           = "03:00-04:00"
-  maintenance_window      = "Mon:04:00-Mon:05:00"
-
+  backup_retention_period   = 7
+  backup_window             = "03:00-04:00"
+  maintenance_window        = "Mon:04:00-Mon:05:00"
   skip_final_snapshot       = false
   final_snapshot_identifier = "used-car-ai-postgres-final"
 
@@ -607,30 +621,13 @@ resource "aws_elasticache_subnet_group" "main" {
   subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_c.id]
 }
 
-resource "aws_security_group" "redis" {
-  name        = "used-car-ai-redis-sg"
-  description = "Redis Security Group"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    from_port       = 6379
-    to_port         = 6379
-    protocol        = "tcp"
-    security_groups = [aws_security_group.api.id]
-  }
-
-  tags = {
-    Name = "used-car-ai-redis-sg"
-  }
-}
-
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id = "used-car-ai-redis"
   description          = "LLaMA 추론 결과 캐싱"
 
-  node_type            = "cache.t3.micro"
-  num_cache_clusters   = 1
-  port                 = 6379
+  node_type          = "cache.t3.micro"
+  num_cache_clusters = 1
+  port               = 6379
 
   subnet_group_name  = aws_elasticache_subnet_group.main.name
   security_group_ids = [aws_security_group.redis.id]
@@ -741,8 +738,7 @@ resource "aws_api_gateway_integration" "inference" {
 
 resource "aws_api_gateway_deployment" "main" {
   rest_api_id = aws_api_gateway_rest_api.main.id
-
-  depends_on = [aws_api_gateway_integration.inference]
+  depends_on  = [aws_api_gateway_integration.inference]
 
   lifecycle {
     create_before_destroy = true
@@ -800,6 +796,26 @@ resource "aws_cloudwatch_metric_alarm" "rds_cpu_high" {
 
   tags = {
     Name = "used-car-ai-rds-cpu-alarm"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "redis_cpu_high" {
+  alarm_name          = "used-car-ai-redis-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ElastiCache"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 75
+  alarm_description   = "Redis CPU 사용률 75% 초과"
+
+  dimensions = {
+    ReplicationGroupId = aws_elasticache_replication_group.redis.id
+  }
+
+  tags = {
+    Name = "used-car-ai-redis-cpu-alarm"
   }
 }
 
